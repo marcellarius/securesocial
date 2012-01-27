@@ -18,12 +18,17 @@ package controllers.securesocial;
 import play.Logger;
 import play.Play;
 import play.i18n.Messages;
+import play.libs.Crypto;
 import play.libs.OAuth;
 import play.mvc.Before;
 import play.mvc.Controller;
+import play.mvc.Http;
+import play.mvc.Util;
 import securesocial.provider.*;
 
 import java.util.Collection;
+
+import com.google.gson.Gson;
 
 /**
  * This is the main controller for the SecureSocial module.
@@ -42,12 +47,17 @@ public class SecureSocial extends Controller {
     private static final String SECURESOCIAL_LOGOUT_REDIRECT = "securesocial.logout.redirect";
     private static final String SECURESOCIAL_SECURE_SOCIAL_LOGIN = "securesocial.SecureSocial.login";
 
+    private static final String AUTH_COOKIE_NAME = "authCookie";
+    private static final String AUTH_COOKIE_EXPIRY = "28d";
+    
     /**
      * Checks if there is a user logged in and redirects to the login page if not.
      */
     @Before(unless={"login", "authenticate", "logout"})
     static void checkAccess() throws Throwable
     {
+    	doAutoLogin();
+    	
         final UserId userId = getUserId();
 
         if ( userId == null ) {
@@ -124,9 +134,9 @@ public class SecureSocial extends Controller {
     /*
      * Sets the SecureSocial cookies in the session.
      */
-    private static void setUserId(SocialUser user) {
-        session.put(USER_COOKIE, user.id.id);
-        session.put(NETWORK_COOKIE, user.id.provider.toString());
+    private static void setUserId(String id, String provider) {
+        session.put(USER_COOKIE, id);
+        session.put(NETWORK_COOKIE, provider);
     }
 
     /*
@@ -153,11 +163,26 @@ public class SecureSocial extends Controller {
      * The action for the login page.
      */
     public static void login() {
-        final Collection providers = ProviderRegistry.all();
-        flash.keep(ORIGINAL_URL);
-        boolean userPassEnabled = ProviderRegistry.get(ProviderType.userpass) != null;
-        render(providers, userPassEnabled);
-
+    	if (doAutoLogin()) {
+    		redirectToOriginalUrl();
+    	}
+    	else {
+	        final Collection providers = ProviderRegistry.all();
+	        flash.keep(ORIGINAL_URL);
+	        boolean userPassEnabled = ProviderRegistry.get(ProviderType.userpass) != null;
+	        render(providers, userPassEnabled);
+    	}
+    }
+    
+    public static boolean doAutoLogin() { 
+    	AuthCookie authCookie = getAuthCookie();
+    	if (authCookie != null && authCookie.isValid()) {
+			setUserId(authCookie.id, authCookie.provider);
+    		return true;
+    	}
+    	else {
+    		return false;
+    	}
     }
 
     /**
@@ -165,6 +190,7 @@ public class SecureSocial extends Controller {
      */
     public static void logout() {
         clearUserId();
+        response.removeCookie(AUTH_COOKIE_NAME);
         final String redirectTo = Play.configuration.getProperty(SECURESOCIAL_LOGOUT_REDIRECT, SECURESOCIAL_SECURE_SOCIAL_LOGIN);
         redirect(redirectTo);
     }
@@ -186,12 +212,11 @@ public class SecureSocial extends Controller {
         flash.keep(ORIGINAL_URL);
 
         IdentityProvider provider = ProviderRegistry.get(type);
-        String originalUrl = null;
         
         try {
             SocialUser user = provider.authenticate();
-            setUserId(user);
-            originalUrl = flash.get(ORIGINAL_URL);
+            setUserId(user.id.id, user.id.provider.toString());
+            saveAuthCookie(new AuthCookie(user.id.id, user.id.provider.toString()));
         } catch ( Exception e ) {
             e.printStackTrace();
             Logger.error(e, "Error authenticating user");
@@ -201,9 +226,30 @@ public class SecureSocial extends Controller {
             flash.keep(ORIGINAL_URL); 
             login();
         }
-        redirect( originalUrl != null ? originalUrl : ROOT);
+        
+        redirectToOriginalUrl();
     }
 
+    private static void saveAuthCookie(AuthCookie cookie) {
+    	String cookieData = new Gson().toJson(cookie);
+        response.setCookie(AUTH_COOKIE_NAME, cookieData, AUTH_COOKIE_EXPIRY);
+    }
+    
+    private static AuthCookie getAuthCookie() {
+    	Http.Cookie c = request.cookies.get(AUTH_COOKIE_NAME);
+    	if (c != null) {
+    		return new Gson().fromJson(c.value, AuthCookie.class);
+    	}
+    	else {
+    		return null;
+    	}
+    }
+    
+    private static void redirectToOriginalUrl() {
+    	String originalUrl = flash.get(ORIGINAL_URL);
+    	redirect( originalUrl != null ? originalUrl : ROOT);
+    }
+    
     /**
      * A helper class to integrate SecureSocial with the Deadbolt module.
      *
@@ -225,5 +271,25 @@ public class SecureSocial extends Controller {
         public static void beforeRoleCheck() throws Throwable {
             checkAccess();
         }
+    }
+    
+    public static class AuthCookie {
+		public String sig;
+		public String provider;
+		public String id;
+		
+		public AuthCookie(String id, String provider) {
+			this.id = id;
+			this.provider = provider;
+			sign();
+		}
+		
+		public void sign() {
+			sig = Crypto.sign(id + provider);
+		}
+		
+		public boolean isValid() {
+			return Crypto.sign(id + provider).equals(sig);
+		}
     }
 }
